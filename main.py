@@ -19,7 +19,7 @@ def get_model():
     """Load model on first use (lazy loading)"""
     global model
     if model is None:
-        model = WhisperModel("base", device="cpu", compute_type="int8")
+        model = WhisperModel("small", device="cpu", compute_type="int8")
     return model
 
 @app.get("/health")
