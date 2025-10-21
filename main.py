@@ -5,8 +5,10 @@ import os
 import logging
 import asyncio
 import uuid
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
 
 # Setup logging
@@ -20,6 +22,10 @@ model = None
 
 # Job storage for async operations
 jobs = {}
+jobs_lock = threading.Lock()
+
+# Thread pool for transcription tasks
+executor = ThreadPoolExecutor(max_workers=1)
 
 def get_model():
     """Load model on first use (lazy loading)"""
@@ -160,8 +166,8 @@ async def transcribe_async(file: UploadFile = File(...), language: str = None):
 
         logger.info(f"Queued transcription job {job_id} for file {file.filename}")
 
-        # Start async transcription task
-        asyncio.create_task(process_transcription_async(job_id, temp_file, language))
+        # Start transcription in thread pool (keeps API responsive)
+        executor.submit(process_transcription_async, job_id, temp_file, language)
 
         return JSONResponse({
             "job_id": job_id,
@@ -173,12 +179,13 @@ async def transcribe_async(file: UploadFile = File(...), language: str = None):
         logger.error(f"Error queuing transcription: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_transcription_async(job_id: str, file_path: Path, language: str = None):
-    """Background task for async transcription"""
+def process_transcription_async(job_id: str, file_path: Path, language: str = None):
+    """Background task for async transcription (runs in thread pool)"""
     try:
         logger.info(f"Starting transcription for job {job_id}")
-        jobs[job_id]["status"] = "processing"
-        jobs[job_id]["started_at"] = datetime.utcnow().isoformat()
+        with jobs_lock:
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["started_at"] = datetime.utcnow().isoformat()
 
         # Load model
         whisper_model = get_model()
@@ -230,22 +237,24 @@ async def process_transcription_async(job_id: str, file_path: Path, language: st
                 for lang, prob in info.all_language_probs[:10]
             ]
 
-        # Update job with results
-        jobs[job_id].update({
-            "status": "completed",
-            "completed_at": datetime.utcnow().isoformat(),
-            **result
-        })
+        # Update job with results (thread-safe)
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "completed",
+                "completed_at": datetime.utcnow().isoformat(),
+                **result
+            })
 
         logger.info(f"Job {job_id}: Transcription completed successfully")
 
     except Exception as e:
         logger.error(f"Job {job_id}: Transcription error - {str(e)}")
-        jobs[job_id].update({
-            "status": "error",
-            "error": str(e),
-            "completed_at": datetime.utcnow().isoformat()
-        })
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "error",
+                "error": str(e),
+                "completed_at": datetime.utcnow().isoformat()
+            })
 
     finally:
         # Cleanup file
@@ -271,10 +280,10 @@ async def transcribe_status(job_id: str):
     - error: Job failed (includes error message)
     - not_found: Job ID does not exist
     """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return JSONResponse(jobs[job_id])
+    with jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return JSONResponse(dict(jobs[job_id]))
 
 @app.get("/transcribe-jobs")
 async def list_jobs():
@@ -283,18 +292,19 @@ async def list_jobs():
 
     Returns a summary of all jobs with their current status.
     """
-    return JSONResponse({
-        "total_jobs": len(jobs),
-        "jobs": {
-            job_id: {
-                "status": job.get("status"),
-                "filename": job.get("filename"),
-                "created_at": job.get("created_at"),
-                "completed_at": job.get("completed_at")
+    with jobs_lock:
+        return JSONResponse({
+            "total_jobs": len(jobs),
+            "jobs": {
+                job_id: {
+                    "status": job.get("status"),
+                    "filename": job.get("filename"),
+                    "created_at": job.get("created_at"),
+                    "completed_at": job.get("completed_at")
+                }
+                for job_id, job in jobs.items()
             }
-            for job_id, job in jobs.items()
-        }
-    })
+        })
 
 if __name__ == "__main__":
     import uvicorn
